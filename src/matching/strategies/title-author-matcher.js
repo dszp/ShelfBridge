@@ -12,6 +12,7 @@
 import logger from '../../logger.js';
 import {
   extractTitle,
+  extractTitleWithoutSubtitle,
   extractAuthor,
   extractNarrator,
   detectUserBookFormat,
@@ -38,6 +39,7 @@ export class TitleAuthorMatcher {
    * @param {string} userId - User ID for caching
    * @param {Function} findUserBookByEditionId - Function to find user books by edition ID
    * @param {Function} findUserBookByBookId - Function to find user books by book ID
+   * @param {Function} listUserBooks - Function returning the user's library books
    * @returns {Object|null} - Hardcover match object or null if not found
    */
   async findMatch(
@@ -45,10 +47,12 @@ export class TitleAuthorMatcher {
     userId,
     findUserBookByEditionId = null,
     findUserBookByBookId = null,
+    listUserBooks = null,
   ) {
     // Store the user library lookup functions for use in this matching session
     this._findUserBookByEditionIdImpl = findUserBookByEditionId;
     this._findUserBookByBookIdImpl = findUserBookByBookId;
+    this._listUserBooksImpl = listUserBooks;
 
     const title = extractTitle(absBook);
     const author = extractAuthor(absBook);
@@ -106,236 +110,82 @@ export class TitleAuthorMatcher {
         `Title/author cache miss for "${title}" - using search API (more reliable than direct GraphQL)`,
       );
 
-      // Extract source book metadata for logging
-      const { extractSeries, extractPublicationYear } =
-        await import('../utils/audiobookshelf-extractor.js');
-      const sourceSeries = extractSeries(absBook);
-      const sourceYear = extractPublicationYear(absBook);
-
-      // Normalize title for Hardcover API search to fix issues like "(Unabridged)" suffix breaking search
-      const normalizedSearchTitle = normalizeTitle(title);
-
-      logger.debug(`Title/author search initiated for "${title}"`, {
-        searchTitle: title,
-        normalizedSearchTitle: normalizedSearchTitle, // Log both for debugging
-        searchAuthor: author || 'N/A',
-        searchNarrator: narrator || 'N/A',
-        userFormat: userFormat,
-        maxResults: maxResults,
-        confidenceThreshold: `${(confidenceThreshold * 100).toFixed(1)}%`,
-        sourceBookMetadata: {
-          series: sourceSeries?.name || 'N/A',
-          seriesPosition: sourceSeries?.position || 'N/A',
-          publicationYear: sourceYear || 'N/A',
-          bookId: absBook.id || 'N/A',
-        },
-      });
-
-      const searchResults = await this.hardcoverClient.searchBooksForMatching(
-        normalizedSearchTitle, // Use normalized title for API search
+      const libraryThreshold = config.library_confidence_threshold ?? 0.6;
+      const libraryMatch = this._findLibraryMatch(
+        absBook,
+        title,
         author,
-        narrator,
-        maxResults,
+        libraryThreshold,
       );
 
-      logger.debug(`Title/author search results for "${title}"`, {
-        resultCount: searchResults.length,
-        searchMetadata: {
-          searchTitle: title,
-          searchAuthor: author || 'N/A',
-          searchNarrator: narrator || 'N/A',
-          searchTimestamp:
-            searchResults[0]?._searchMetadata?.searchTimestamp || Date.now(),
-          searchStrategy:
-            searchResults[0]?._searchMetadata?.searchStrategy || 'unknown',
-        },
-        results: searchResults.map(result => ({
-          title: result.title,
-          author:
-            result.contributions?.map(c => c.author?.name).join(', ') || 'N/A',
-          bookId: result.id,
-          hasEditions: !!(result.editions && result.editions.length > 0),
-          editionCount: result.editions?.length || 0,
-          // Include additional metadata that helps with troubleshooting
-          series: result.series?.name || 'N/A',
-          seriesPosition: result.series?.position || 'N/A',
-          publicationYear: result.publication_year || 'N/A',
-          // Include identifiers if available
-          identifiers: {
-            isbn_10: result.isbn_10 || result.editions?.[0]?.isbn_10 || 'N/A',
-            isbn_13: result.isbn_13 || result.editions?.[0]?.isbn_13 || 'N/A',
-            asin: result.asin || result.editions?.[0]?.asin || 'N/A',
-          },
-          // Include format information
-          formats:
-            result.editions?.map(ed => ({
-              id: ed.id,
-              format:
-                ed.reading_format?.format || ed.physical_format || 'unknown',
-              pages: ed.pages || 'N/A',
-              audioSeconds: ed.audio_seconds || 'N/A',
-            })) || [],
-          // Include activity/popularity if available
-          usersCount: result.users_count || 'N/A',
-          ratingsCount: result.ratings_count || 'N/A',
-          averageRating: result.average_rating || 'N/A',
-        })),
-      });
+      let bestBookMatch = libraryMatch;
+      let candidatesEvaluated = libraryMatch ? 1 : 0;
 
-      if (searchResults.length === 0) {
-        logger.debug(
-          `No search results found for "${title}" in Hardcover database`,
-          {
-            searchedTitle: title,
-            searchedAuthor: author || 'N/A',
-            reason:
-              'Book may not exist in Hardcover database or search terms may not match exactly',
-          },
+      if (!libraryMatch) {
+        let bookScoredResults = await this._searchAndScore(
+          normalizeTitle(title), // Normalized title fixes "(Unabridged)" breaking search
+          absBook,
+          title,
+          author,
+          narrator,
+          maxResults,
+          confidenceThreshold,
         );
-        return null;
-      }
 
-      // ========================================================================
-      // STAGE 1: BOOK IDENTIFICATION SCORING
-      // ========================================================================
-
-      logger.debug(
-        `Stage 1: Book identification for "${title}" (threshold: ${(confidenceThreshold * 100).toFixed(1)}%, format: ${userFormat})`,
-      );
-
-      const scoringErrors = [];
-      const bookScoredResults = searchResults.map(result => {
-        try {
-          // Use book identification scoring instead of full scoring
-          const bookScore = calculateBookIdentificationScore(
-            result,
+        // A catalog that stores the subtitle separately may not find
+        // "title: subtitle" at all, so search again with the title alone
+        const bareTitle = extractTitleWithoutSubtitle(absBook);
+        if (
+          !this._passesThreshold(bookScoredResults[0], confidenceThreshold) &&
+          bareTitle &&
+          normalizeTitle(bareTitle) !== normalizeTitle(title)
+        ) {
+          logger.debug(
+            `Retrying title/author search for "${title}" without subtitle`,
+            {
+              bareTitle,
+            },
+          );
+          const retryResults = await this._searchAndScore(
+            normalizeTitle(bareTitle),
+            absBook,
             title,
             author,
-            absBook,
+            narrator,
+            maxResults,
+            confidenceThreshold,
           );
-
-          return {
-            ...result,
-            _bookIdentificationScore: bookScore,
-          };
-        } catch (error) {
-          scoringErrors.push({
-            error: error.message,
-            resultId: result.id,
-            resultTitle: result.title,
-          });
-
-          // Return result with minimum score so it's not selected
-          return {
-            ...result,
-            _bookIdentificationScore: {
-              totalScore: 0,
-              breakdown: {},
-              confidence: 'none',
-              isBookMatch: false,
-            },
-          };
+          const seenIds = new Set(bookScoredResults.map(r => r.id));
+          bookScoredResults = [
+            ...bookScoredResults,
+            ...retryResults.filter(r => !seenIds.has(r.id)),
+          ].sort(
+            (a, b) =>
+              b._bookIdentificationScore.totalScore -
+              a._bookIdentificationScore.totalScore,
+          );
         }
-      });
 
-      // Log scoring errors once with summary
-      if (scoringErrors.length > 0) {
-        const uniqueErrors = [...new Set(scoringErrors.map(e => e.error))];
-        logger.warn(
-          `Scoring errors for "${title}": ${scoringErrors.length} results failed (${uniqueErrors.length} unique errors)`,
-          {
-            errorCount: scoringErrors.length,
-            uniqueErrors,
-            // Only include first few failed results to avoid spam
-            sampleFailures: scoringErrors.slice(0, 2).map(e => ({
-              id: e.resultId,
-              title: e.resultTitle,
-              error: e.error,
-            })),
-          },
-        );
+        if (bookScoredResults.length === 0) {
+          logger.debug(
+            `No search results found for "${title}" in Hardcover database`,
+            {
+              searchedTitle: title,
+              searchedAuthor: author || 'N/A',
+              reason:
+                'Book may not exist in Hardcover database or search terms may not match exactly',
+            },
+          );
+          return null;
+        }
+
+        bestBookMatch = bookScoredResults[0];
+        candidatesEvaluated = bookScoredResults.length;
       }
 
-      // Sort by book identification score descending
-      bookScoredResults.sort(
-        (a, b) =>
-          b._bookIdentificationScore.totalScore -
-          a._bookIdentificationScore.totalScore,
-      );
-
-      // Log detailed scoring results for troubleshooting
-      logger.debug(`Title/author scoring results for "${title}"`, {
-        targetTitle: title,
-        targetAuthor: author || 'N/A',
-        threshold: `${(confidenceThreshold * 100).toFixed(1)}%`,
-        candidates: bookScoredResults.map((result, index) => ({
-          rank: index + 1,
-          title: result.title,
-          author:
-            result.contributions?.map(c => c.author?.name).join(', ') || 'N/A',
-          score: `${result._bookIdentificationScore.totalScore.toFixed(1)}%`,
-          confidence: result._bookIdentificationScore.confidence,
-          isBookMatch: result._bookIdentificationScore.isBookMatch,
-          passesThreshold:
-            result._bookIdentificationScore.totalScore >=
-            confidenceThreshold * 100,
-          breakdown: {
-            title: {
-              score: `${result._bookIdentificationScore.breakdown.title?.score?.toFixed(1) || 0}%`,
-              weight: `${((result._bookIdentificationScore.breakdown.title?.weight || 0) * 100).toFixed(1)}%`,
-              comparison:
-                result._bookIdentificationScore.breakdown.title?.comparison ||
-                'N/A',
-            },
-            author: {
-              score: `${result._bookIdentificationScore.breakdown.author?.score?.toFixed(1) || 0}%`,
-              weight: `${((result._bookIdentificationScore.breakdown.author?.weight || 0) * 100).toFixed(1)}%`,
-              comparison:
-                result._bookIdentificationScore.breakdown.author?.comparison ||
-                'N/A',
-            },
-            series: {
-              score: `${result._bookIdentificationScore.breakdown.series?.score?.toFixed(1) || 0}%`,
-              weight: `${((result._bookIdentificationScore.breakdown.series?.weight || 0) * 100).toFixed(1)}%`,
-              reason:
-                result._bookIdentificationScore.breakdown.series?.reason ||
-                'N/A',
-            },
-            activity: {
-              score: `${result._bookIdentificationScore.breakdown.activity?.score?.toFixed(1) || 0}%`,
-              weight: `${((result._bookIdentificationScore.breakdown.activity?.weight || 0) * 100).toFixed(1)}%`,
-              value:
-                result._bookIdentificationScore.breakdown.activity?.value ||
-                'N/A',
-            },
-            year: {
-              score: `${result._bookIdentificationScore.breakdown.year?.score?.toFixed(1) || 0}%`,
-              weight: `${((result._bookIdentificationScore.breakdown.year?.weight || 0) * 100).toFixed(1)}%`,
-              comparison:
-                result._bookIdentificationScore.breakdown.year?.comparison ||
-                'N/A',
-            },
-            penalties: Object.keys(result._bookIdentificationScore.breakdown)
-              .filter(key => key.includes('Penalty'))
-              .map(key => ({
-                type: key,
-                score: `${result._bookIdentificationScore.breakdown[key]?.score?.toFixed(1) || 0}%`,
-                reason:
-                  result._bookIdentificationScore.breakdown[key]?.reason ||
-                  'N/A',
-              })),
-          },
-        })),
-      });
-
-      // Find best book match above identification threshold
-      const bestBookMatch = bookScoredResults[0];
-
       if (
-        bestBookMatch &&
-        bestBookMatch._bookIdentificationScore.isBookMatch &&
-        bestBookMatch._bookIdentificationScore.totalScore >=
-          confidenceThreshold * 100
+        libraryMatch ||
+        this._passesThreshold(bestBookMatch, confidenceThreshold)
       ) {
         // ====================================================================
         // STAGE 2: EDITION SELECTION
@@ -497,7 +347,9 @@ export class TitleAuthorMatcher {
               id: selectedEditionResult.bookId,
               title: selectedEditionResult.title,
             },
-            _matchType: 'title_author_two_stage',
+            _matchType: libraryMatch
+              ? 'title_author_library'
+              : 'title_author_two_stage',
             _tier: 3,
             _bookIdentificationScore: bestBookMatch._bookIdentificationScore,
             _editionSelectionResult: selectedEditionResult,
@@ -526,7 +378,7 @@ export class TitleAuthorMatcher {
           searchedTitle: title,
           searchedAuthor: author || 'N/A',
           threshold: `${(confidenceThreshold * 100).toFixed(1)}%`,
-          candidatesEvaluated: bookScoredResults.length,
+          candidatesEvaluated,
           bestScore: bestBookMatch ? `${bestScore.toFixed(1)}%` : 'N/A',
           reason: bestBookMatch
             ? bestBookMatch._bookIdentificationScore.isBookMatch
@@ -571,6 +423,335 @@ export class TitleAuthorMatcher {
       );
       return null;
     }
+  }
+
+  /**
+   * Check whether a scored result is a book match at or above a threshold
+   * @param {Object|undefined} result - Result with _bookIdentificationScore
+   * @param {number} threshold - Threshold (0-1)
+   * @returns {boolean}
+   * @private
+   */
+  _passesThreshold(result, threshold) {
+    return Boolean(
+      result &&
+      result._bookIdentificationScore.isBookMatch &&
+      result._bookIdentificationScore.totalScore >= threshold * 100,
+    );
+  }
+
+  /**
+   * Find the book in the user's own Hardcover library by title and author
+   *
+   * Books already on the user's shelf are accepted at a lower threshold than
+   * catalog results, because the candidate set is small and the user chose
+   * them. The lower threshold only makes up for metadata library books lack
+   * (year, series, activity); the author must still score at least 80, since
+   * fuzzy author similarity alone rates unrelated names around 40-50. Two
+   * different books scoring within 5 points of each other are treated as
+   * ambiguous and left to the catalog search.
+   *
+   * @param {Object} absBook - Audiobookshelf book object
+   * @param {string} title - Title used for scoring
+   * @param {string} author - Author used for scoring
+   * @param {number} threshold - Library threshold (0-1)
+   * @returns {Object|null} - Library book with _bookIdentificationScore, or null
+   * @private
+   */
+  _findLibraryMatch(absBook, title, author, threshold) {
+    const userBooks = this._listUserBooksImpl ? this._listUserBooksImpl() : [];
+
+    const candidates = [];
+    for (const userBook of userBooks || []) {
+      if (!userBook?.book) continue;
+      const bookScore = calculateBookIdentificationScore(
+        userBook.book,
+        title,
+        author,
+        absBook,
+      );
+      const candidate = {
+        ...userBook.book,
+        _bookIdentificationScore: bookScore,
+      };
+      if (
+        this._passesThreshold(candidate, threshold) &&
+        bookScore.breakdown.author.score >= 80
+      ) {
+        candidates.push(candidate);
+      }
+    }
+
+    if (candidates.length === 0) return null;
+
+    candidates.sort(
+      (a, b) =>
+        b._bookIdentificationScore.totalScore -
+        a._bookIdentificationScore.totalScore,
+    );
+    const [best, runnerUp] = candidates;
+
+    if (
+      runnerUp &&
+      runnerUp.id !== best.id &&
+      best._bookIdentificationScore.totalScore -
+        runnerUp._bookIdentificationScore.totalScore <
+        5
+    ) {
+      logger.debug(
+        `Library match for "${title}" is ambiguous; searching the catalog`,
+        {
+          candidates: candidates.slice(0, 3).map(c => ({
+            bookId: c.id,
+            title: c.title,
+            score: `${c._bookIdentificationScore.totalScore.toFixed(1)}%`,
+          })),
+        },
+      );
+      return null;
+    }
+
+    logger.debug(`Found "${title}" in user library by title/author`, {
+      bookId: best.id,
+      libraryTitle: best.title,
+      score: `${best._bookIdentificationScore.totalScore.toFixed(1)}%`,
+      threshold: `${(threshold * 100).toFixed(1)}%`,
+    });
+    return best;
+  }
+
+  /**
+   * Search the Hardcover catalog and score each result for book identity
+   * @param {string} searchTitle - Normalized title to send to the search API
+   * @param {Object} absBook - Audiobookshelf book object
+   * @param {string} title - Title used for scoring and logging
+   * @param {string} author - Author used for searching and scoring
+   * @param {string} narrator - Narrator used for searching
+   * @param {number} maxResults - Maximum search results to request
+   * @param {number} confidenceThreshold - Catalog threshold (0-1), for logging
+   * @returns {Promise<Array>} - Results with _bookIdentificationScore, best first
+   * @private
+   */
+  async _searchAndScore(
+    searchTitle,
+    absBook,
+    title,
+    author,
+    narrator,
+    maxResults,
+    confidenceThreshold,
+  ) {
+    const userFormat = detectUserBookFormat(absBook);
+
+    // Extract source book metadata for logging
+    const { extractSeries, extractPublicationYear } =
+      await import('../utils/audiobookshelf-extractor.js');
+    const sourceSeries = extractSeries(absBook);
+    const sourceYear = extractPublicationYear(absBook);
+
+    logger.debug(`Title/author search initiated for "${title}"`, {
+      searchTitle: title,
+      normalizedSearchTitle: searchTitle, // Log both for debugging
+      searchAuthor: author || 'N/A',
+      searchNarrator: narrator || 'N/A',
+      userFormat: userFormat,
+      maxResults: maxResults,
+      confidenceThreshold: `${(confidenceThreshold * 100).toFixed(1)}%`,
+      sourceBookMetadata: {
+        series: sourceSeries?.name || 'N/A',
+        seriesPosition: sourceSeries?.position || 'N/A',
+        publicationYear: sourceYear || 'N/A',
+        bookId: absBook.id || 'N/A',
+      },
+    });
+
+    const searchResults = await this.hardcoverClient.searchBooksForMatching(
+      searchTitle, // Use normalized title for API search
+      author,
+      narrator,
+      maxResults,
+    );
+
+    logger.debug(`Title/author search results for "${title}"`, {
+      resultCount: searchResults.length,
+      searchMetadata: {
+        searchTitle: title,
+        searchAuthor: author || 'N/A',
+        searchNarrator: narrator || 'N/A',
+        searchTimestamp:
+          searchResults[0]?._searchMetadata?.searchTimestamp || Date.now(),
+        searchStrategy:
+          searchResults[0]?._searchMetadata?.searchStrategy || 'unknown',
+      },
+      results: searchResults.map(result => ({
+        title: result.title,
+        author:
+          result.contributions?.map(c => c.author?.name).join(', ') || 'N/A',
+        bookId: result.id,
+        hasEditions: !!(result.editions && result.editions.length > 0),
+        editionCount: result.editions?.length || 0,
+        // Include additional metadata that helps with troubleshooting
+        series: result.series?.name || 'N/A',
+        seriesPosition: result.series?.position || 'N/A',
+        publicationYear: result.publication_year || 'N/A',
+        // Include identifiers if available
+        identifiers: {
+          isbn_10: result.isbn_10 || result.editions?.[0]?.isbn_10 || 'N/A',
+          isbn_13: result.isbn_13 || result.editions?.[0]?.isbn_13 || 'N/A',
+          asin: result.asin || result.editions?.[0]?.asin || 'N/A',
+        },
+        // Include format information
+        formats:
+          result.editions?.map(ed => ({
+            id: ed.id,
+            format:
+              ed.reading_format?.format || ed.physical_format || 'unknown',
+            pages: ed.pages || 'N/A',
+            audioSeconds: ed.audio_seconds || 'N/A',
+          })) || [],
+        // Include activity/popularity if available
+        usersCount: result.users_count || 'N/A',
+        ratingsCount: result.ratings_count || 'N/A',
+        averageRating: result.average_rating || 'N/A',
+      })),
+    });
+
+    if (searchResults.length === 0) {
+      return [];
+    }
+
+    // ========================================================================
+    // STAGE 1: BOOK IDENTIFICATION SCORING
+    // ========================================================================
+
+    logger.debug(
+      `Stage 1: Book identification for "${title}" (threshold: ${(confidenceThreshold * 100).toFixed(1)}%, format: ${userFormat})`,
+    );
+
+    const scoringErrors = [];
+    const bookScoredResults = searchResults.map(result => {
+      try {
+        // Use book identification scoring instead of full scoring
+        const bookScore = calculateBookIdentificationScore(
+          result,
+          title,
+          author,
+          absBook,
+        );
+
+        return {
+          ...result,
+          _bookIdentificationScore: bookScore,
+        };
+      } catch (error) {
+        scoringErrors.push({
+          error: error.message,
+          resultId: result.id,
+          resultTitle: result.title,
+        });
+
+        // Return result with minimum score so it's not selected
+        return {
+          ...result,
+          _bookIdentificationScore: {
+            totalScore: 0,
+            breakdown: {},
+            confidence: 'none',
+            isBookMatch: false,
+          },
+        };
+      }
+    });
+
+    // Log scoring errors once with summary
+    if (scoringErrors.length > 0) {
+      const uniqueErrors = [...new Set(scoringErrors.map(e => e.error))];
+      logger.warn(
+        `Scoring errors for "${title}": ${scoringErrors.length} results failed (${uniqueErrors.length} unique errors)`,
+        {
+          errorCount: scoringErrors.length,
+          uniqueErrors,
+          // Only include first few failed results to avoid spam
+          sampleFailures: scoringErrors.slice(0, 2).map(e => ({
+            id: e.resultId,
+            title: e.resultTitle,
+            error: e.error,
+          })),
+        },
+      );
+    }
+
+    // Sort by book identification score descending
+    bookScoredResults.sort(
+      (a, b) =>
+        b._bookIdentificationScore.totalScore -
+        a._bookIdentificationScore.totalScore,
+    );
+
+    // Log detailed scoring results for troubleshooting
+    logger.debug(`Title/author scoring results for "${title}"`, {
+      targetTitle: title,
+      targetAuthor: author || 'N/A',
+      threshold: `${(confidenceThreshold * 100).toFixed(1)}%`,
+      candidates: bookScoredResults.map((result, index) => ({
+        rank: index + 1,
+        title: result.title,
+        author:
+          result.contributions?.map(c => c.author?.name).join(', ') || 'N/A',
+        score: `${result._bookIdentificationScore.totalScore.toFixed(1)}%`,
+        confidence: result._bookIdentificationScore.confidence,
+        isBookMatch: result._bookIdentificationScore.isBookMatch,
+        passesThreshold:
+          result._bookIdentificationScore.totalScore >=
+          confidenceThreshold * 100,
+        breakdown: {
+          title: {
+            score: `${result._bookIdentificationScore.breakdown.title?.score?.toFixed(1) || 0}%`,
+            weight: `${((result._bookIdentificationScore.breakdown.title?.weight || 0) * 100).toFixed(1)}%`,
+            comparison:
+              result._bookIdentificationScore.breakdown.title?.comparison ||
+              'N/A',
+          },
+          author: {
+            score: `${result._bookIdentificationScore.breakdown.author?.score?.toFixed(1) || 0}%`,
+            weight: `${((result._bookIdentificationScore.breakdown.author?.weight || 0) * 100).toFixed(1)}%`,
+            comparison:
+              result._bookIdentificationScore.breakdown.author?.comparison ||
+              'N/A',
+          },
+          series: {
+            score: `${result._bookIdentificationScore.breakdown.series?.score?.toFixed(1) || 0}%`,
+            weight: `${((result._bookIdentificationScore.breakdown.series?.weight || 0) * 100).toFixed(1)}%`,
+            reason:
+              result._bookIdentificationScore.breakdown.series?.reason || 'N/A',
+          },
+          activity: {
+            score: `${result._bookIdentificationScore.breakdown.activity?.score?.toFixed(1) || 0}%`,
+            weight: `${((result._bookIdentificationScore.breakdown.activity?.weight || 0) * 100).toFixed(1)}%`,
+            value:
+              result._bookIdentificationScore.breakdown.activity?.value ||
+              'N/A',
+          },
+          year: {
+            score: `${result._bookIdentificationScore.breakdown.year?.score?.toFixed(1) || 0}%`,
+            weight: `${((result._bookIdentificationScore.breakdown.year?.weight || 0) * 100).toFixed(1)}%`,
+            comparison:
+              result._bookIdentificationScore.breakdown.year?.comparison ||
+              'N/A',
+          },
+          penalties: Object.keys(result._bookIdentificationScore.breakdown)
+            .filter(key => key.includes('Penalty'))
+            .map(key => ({
+              type: key,
+              score: `${result._bookIdentificationScore.breakdown[key]?.score?.toFixed(1) || 0}%`,
+              reason:
+                result._bookIdentificationScore.breakdown[key]?.reason || 'N/A',
+            })),
+        },
+      })),
+    });
+
+    return bookScoredResults;
   }
 
   /**

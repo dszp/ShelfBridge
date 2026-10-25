@@ -52,6 +52,17 @@ The title/author matching has been **completely redesigned** with a two-stage ar
   - Activity: **10%** (↓ from 18%) - Popularity indicator
   - Year: **5%** (↓ from 7%) - Minor disambiguation
 - **Bonuses**: Perfect match (+10%) and high confidence (+5%) bonuses
+- **Subtitles**: Audiobookshelf titles include the subtitle, such as "Atomic Habits: An Easy & Proven Way to Build Good Habits & Break Bad Ones". Hardcover often stores only "Atomic Habits". ShelfBridge scores the title with and without the subtitle and uses the higher score. If no result passes the threshold, ShelfBridge searches again with the title alone.
+
+### **Library check before the catalog search**
+
+Before it searches the Hardcover catalog, ShelfBridge scores the books in your Hardcover library against the title and author. A library book matches when all of these are true:
+
+- Its score is at least `library_confidence_threshold` (60% default). Library books have no popularity data, so they score lower than the same book from the catalog.
+- Its author similarity is at least 80%.
+- No other library book scores within 5 points of it.
+
+If no library book matches, ShelfBridge searches the catalog and applies `confidence_threshold`.
 
 ### **Stage 2: Edition Selection**
 
@@ -235,6 +246,7 @@ global:
   title_author_matching:
     enabled: true # Default: true
     confidence_threshold: 0.70 # Minimum confidence (70%)
+    library_confidence_threshold: 0.60 # Minimum confidence for books in your library (60%)
     max_search_results: 5 # Limit edition search results
 
   # Fine-tune scoring weights (advanced)

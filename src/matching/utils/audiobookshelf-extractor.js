@@ -92,62 +92,53 @@ export function extractAsin(bookData) {
 }
 
 /**
- * Extract title from book data
+ * Find the title and subtitle in book data
  * @param {Object} bookData - Book data object
- * @returns {string|null} - Book title or null
+ * @returns {{title: string, subtitle: string|null}|null} - Title parts or null
  */
-export function extractTitle(bookData) {
+function findTitleParts(bookData) {
   if (!bookData) return null;
 
-  // Try different title fields in order of preference
+  // Try different title fields in order of preference, at the top level,
+  // then in metadata, then in media metadata
   const titleFields = ['title', 'name'];
+  const sources = [bookData, bookData.metadata, bookData.media?.metadata];
 
-  for (const field of titleFields) {
-    if (bookData[field] && typeof bookData[field] === 'string') {
-      const title = bookData[field].trim();
-      const sub = bookData.subtitle;
-      if (sub && typeof sub === 'string' && sub.trim()) {
-        return `${title}: ${sub.trim()}`;
-      }
-      return title;
-    }
-  }
-
-  // Check metadata object
-  if (bookData.metadata) {
+  for (const source of sources) {
+    if (!source) continue;
     for (const field of titleFields) {
-      if (
-        bookData.metadata[field] &&
-        typeof bookData.metadata[field] === 'string'
-      ) {
-        const title = bookData.metadata[field].trim();
-        const sub = bookData.metadata.subtitle;
-        if (sub && typeof sub === 'string' && sub.trim()) {
-          return `${title}: ${sub.trim()}`;
-        }
-        return title;
-      }
-    }
-  }
-
-  // Check media metadata
-  if (bookData.media && bookData.media.metadata) {
-    for (const field of titleFields) {
-      if (
-        bookData.media.metadata[field] &&
-        typeof bookData.media.metadata[field] === 'string'
-      ) {
-        const title = bookData.media.metadata[field].trim();
-        const sub = bookData.media.metadata.subtitle;
-        if (sub && typeof sub === 'string' && sub.trim()) {
-          return `${title}: ${sub.trim()}`;
-        }
-        return title;
+      if (source[field] && typeof source[field] === 'string') {
+        const sub = source.subtitle;
+        return {
+          title: source[field].trim(),
+          subtitle:
+            sub && typeof sub === 'string' && sub.trim() ? sub.trim() : null,
+        };
       }
     }
   }
 
   return null;
+}
+
+/**
+ * Extract title from book data, including the subtitle when present
+ * @param {Object} bookData - Book data object
+ * @returns {string|null} - Book title or null
+ */
+export function extractTitle(bookData) {
+  const parts = findTitleParts(bookData);
+  if (!parts) return null;
+  return parts.subtitle ? `${parts.title}: ${parts.subtitle}` : parts.title;
+}
+
+/**
+ * Extract title from book data without the subtitle
+ * @param {Object} bookData - Book data object
+ * @returns {string|null} - Book title or null
+ */
+export function extractTitleWithoutSubtitle(bookData) {
+  return findTitleParts(bookData)?.title || null;
 }
 
 /**

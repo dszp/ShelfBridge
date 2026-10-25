@@ -209,6 +209,7 @@ global:
   title_author_matching:
     enabled: true # Enable title/author fallback matching (default: true)
     confidence_threshold: 0.70 # Minimum confidence score (0.0-1.0, default: 0.70)
+    library_confidence_threshold: 0.60 # Minimum confidence for books in your library (0.0-1.0, default: 0.60)
     max_search_results: 5 # Maximum search results to evaluate (default: 5)
 ```
 
@@ -227,6 +228,7 @@ global:
 
 - `enabled`: Boolean, default: `true` - Enable/disable the feature
 - `confidence_threshold`: Number (0.0-1.0), default: `0.70` - Minimum match confidence
+- `library_confidence_threshold`: Number (0.0-1.0), default: `0.60` - Minimum match confidence for a book already in your Hardcover library. ShelfBridge checks your library before it searches the Hardcover catalog. A library match also needs an author similarity of at least 80%.
 - `max_search_results`: Number (1-20), default: `5` - Search result limit for edition matching
 
 #### `scoring_weights` (YAML Only - Advanced)

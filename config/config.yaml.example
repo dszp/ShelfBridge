@@ -129,6 +129,7 @@ users:
 #   title_author_matching:
 #     enabled: true                      # Enable title/author fallback matching (default: true)
 #     confidence_threshold: 0.70         # Minimum confidence score to accept match (0.0-1.0, default: 0.70)
+#     library_confidence_threshold: 0.60 # Minimum confidence for books already in your Hardcover library (0.0-1.0, default: 0.60)
 #     max_search_results: 5             # Maximum search results to evaluate (default: 5)
 #   
 #   # =============================================================================
