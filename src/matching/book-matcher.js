@@ -341,6 +341,7 @@ export class BookMatcher {
               userId,
               this.findUserBookByEditionId.bind(this),
               this.findUserBookByBookId.bind(this),
+              this.listUserBooks.bind(this),
             );
           } else {
             logger.debug(
@@ -631,6 +632,14 @@ export class BookMatcher {
   }
 
   /**
+   * List the user's Hardcover library books
+   * @returns {Array} - User books, each with a book object
+   */
+  listUserBooks() {
+    return this.userLibraryData || [];
+  }
+
+  /**
    * Find book match using title/author strategy with user library context
    * Useful for auto-add scenarios where we need library duplicate detection
    *
@@ -656,6 +665,7 @@ export class BookMatcher {
       userId,
       this.findUserBookByEditionId.bind(this),
       this.findUserBookByBookId.bind(this),
+      this.listUserBooks.bind(this),
     );
   }
 

@@ -16,6 +16,7 @@ import {
 import {
   extractSeries as extractSeriesFromAudiobookshelf,
   extractPublicationYear as extractPublicationYearFromAudiobookshelf,
+  extractTitleWithoutSubtitle,
 } from '../utils/audiobookshelf-extractor.js';
 import {
   extractAuthorFromSearchResult,
@@ -76,17 +77,34 @@ export function calculateBookIdentificationScore(
   // ============================================================================
 
   // 1. Title Similarity (35% weight) - PRIMARY book identification factor
-  const titleScore =
+  // Audiobookshelf titles include the subtitle, which catalogs often store
+  // separately. Score the title without the subtitle too and keep the better
+  // of the two, so "Atomic Habits: An Easy & Proven Way..." can match
+  // "Atomic Habits".
+  const fullTitleScore =
     calculateTextSimilarity(
       normalizeTitle(targetTitle),
       normalizeTitle(resultTitle),
       'title', // Use specialized title fuzzy matching
     ) * 100;
+  const bareTitle = extractTitleWithoutSubtitle(targetMetadata);
+  const bareTitleScore =
+    bareTitle && normalizeTitle(bareTitle) !== normalizeTitle(targetTitle)
+      ? calculateTextSimilarity(
+          normalizeTitle(bareTitle),
+          normalizeTitle(resultTitle),
+          'title',
+        ) * 100
+      : 0;
+  const matchedWithoutSubtitle = bareTitleScore > fullTitleScore;
+  const titleScore = matchedWithoutSubtitle ? bareTitleScore : fullTitleScore;
+  const scoredTitle = matchedWithoutSubtitle ? bareTitle : targetTitle;
   score += titleScore * 0.35;
   breakdown.title = {
     score: titleScore,
     weight: 0.35,
-    comparison: `"${targetTitle}" vs "${resultTitle}"`,
+    comparison: `"${scoredTitle}" vs "${resultTitle}"`,
+    matchedWithoutSubtitle,
   };
 
   // 2. Author Similarity (25% weight) - SECONDARY book identification factor
@@ -163,8 +181,9 @@ export function calculateBookIdentificationScore(
     );
   }
 
-  // Apply penalty for very short titles (higher chance of false matches)
-  const normalizedTitle = normalizeTitle(targetTitle);
+  // Apply penalty for very short titles (higher chance of false matches),
+  // measured on whichever title variant produced the title score
+  const normalizedTitle = normalizeTitle(scoredTitle);
   if (normalizedTitle.length <= 10) {
     const penalty = Math.max(0, 10 - normalizedTitle.length) * 2; // Up to 20% penalty
     score -= penalty;
